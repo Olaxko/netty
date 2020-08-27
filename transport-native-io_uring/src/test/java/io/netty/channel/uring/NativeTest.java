@@ -134,7 +134,7 @@ public class NativeTest {
         assertNotNull(completionQueue);
 
         final FileDescriptor eventFd = Native.newEventFd();
-        assertTrue(submissionQueue.addPollLink(eventFd.intValue()));
+        assertTrue(submissionQueue.addPollIn(eventFd.intValue()));
         submissionQueue.submit();
 
         new Thread() {
@@ -188,7 +188,7 @@ public class NativeTest {
         };
         waitingCqe.start();
         final FileDescriptor eventFd = Native.newEventFd();
-        assertTrue(submissionQueue.addPollLink(eventFd.intValue()));
+        assertTrue(submissionQueue.addPollIn(eventFd.intValue()));
         submissionQueue.submit();
 
         new Thread() {
@@ -216,7 +216,7 @@ public class NativeTest {
         final IOUringCompletionQueue completionQueue = ringBuffer.getIoUringCompletionQueue();
 
         FileDescriptor eventFd = Native.newEventFd();
-        submissionQueue.addPollLink(eventFd.intValue());
+        submissionQueue.addPollIn(eventFd.intValue());
         submissionQueue.submit();
 
         Thread.sleep(10);

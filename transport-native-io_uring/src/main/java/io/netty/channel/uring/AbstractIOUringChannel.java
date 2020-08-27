@@ -55,11 +55,13 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     private static final ChannelMetadata METADATA = new ChannelMetadata(false);
     final LinuxSocket socket;
     protected volatile boolean active;
-    boolean uringInReadyPending;
+    private boolean pollInScheduled = false;
+
+    //boolean uringInReadyPending;
     boolean inputClosedSeenErrorOnRead;
 
     //can only submit one write operation at a time
-    private boolean writeable = true;
+    private boolean writeScheduled = false;
     /**
      * The future of the current connection attempt.  If not null, subsequent connection attempts will fail.
      */
@@ -74,7 +76,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
         super(parent);
         this.socket = checkNotNull(socket, "fd");
         this.active = true;
-        this.uringInReadyPending = false;
 
         if (active) {
             // Directly cache the remote and local addresses
@@ -134,107 +135,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
         return loop instanceof IOUringEventLoop;
     }
 
-    private ByteBuf readBuffer;
-
-    public void doReadBytes(ByteBuf byteBuf) {
-        assert readBuffer == null;
-        IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
-        IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
-
-        unsafe().recvBufAllocHandle().attemptedBytesRead(byteBuf.writableBytes());
-
-        if (byteBuf.hasMemoryAddress()) {
-            readBuffer = byteBuf;
-            submissionQueue.addRead(socket.intValue(), byteBuf.memoryAddress(),
-                                    byteBuf.writerIndex(), byteBuf.capacity());
-            submissionQueue.submit();
-        }
-    }
-
-    void writeComplete(int res) {
-        ChannelOutboundBuffer channelOutboundBuffer = unsafe().outboundBuffer();
-
-        if (res > 0) {
-            channelOutboundBuffer.removeBytes(res);
-            setWriteable(true);
-            try {
-                doWrite(channelOutboundBuffer);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    void readComplete(int localReadAmount) {
-        boolean close = false;
-        ByteBuf byteBuf = null;
-        final IOUringRecvByteAllocatorHandle allocHandle =
-                (IOUringRecvByteAllocatorHandle) unsafe()
-                        .recvBufAllocHandle();
-        final ChannelPipeline pipeline = pipeline();
-        try {
-            logger.trace("EventLoop Read Res: {}", localReadAmount);
-            logger.trace("EventLoop Fd: {}", fd().intValue());
-            setUringInReadyPending(false);
-            byteBuf = this.readBuffer;
-            this.readBuffer = null;
-
-            if (localReadAmount > 0) {
-                byteBuf.writerIndex(byteBuf.writerIndex() + localReadAmount);
-            }
-
-            allocHandle.lastBytesRead(localReadAmount);
-            if (allocHandle.lastBytesRead() <= 0) {
-                // nothing was read, release the buffer.
-                byteBuf.release();
-                byteBuf = null;
-                close = allocHandle.lastBytesRead() < 0;
-                if (close) {
-                    // There is nothing left to read as we received an EOF.
-                    shutdownInput(false);
-                }
-                allocHandle.readComplete();
-                pipeline.fireChannelReadComplete();
-                return;
-            }
-
-            allocHandle.incMessagesRead(1);
-            pipeline.fireChannelRead(byteBuf);
-            byteBuf = null;
-            allocHandle.readComplete();
-            pipeline.fireChannelReadComplete();
-
-            logger.trace("READ autoRead {}", config().isAutoRead());
-            if (config().isAutoRead()) {
-                executeReadEvent();
-            }
-        } catch (Throwable t) {
-            handleReadException(pipeline, byteBuf, t, close, allocHandle);
-        }
-    }
-
-    private void handleReadException(ChannelPipeline pipeline, ByteBuf byteBuf,
-                                     Throwable cause, boolean close,
-                                     IOUringRecvByteAllocatorHandle allocHandle) {
-        if (byteBuf != null) {
-            if (byteBuf.isReadable()) {
-                pipeline.fireChannelRead(byteBuf);
-            } else {
-                byteBuf.release();
-            }
-        }
-        allocHandle.readComplete();
-        pipeline.fireChannelReadComplete();
-        pipeline.fireExceptionCaught(cause);
-        if (close || cause instanceof IOException) {
-            shutdownInput(false);
-        } else {
-            if (config().isAutoRead()) {
-                executeReadEvent();
-            }
-        }
-    }
-
     protected final ByteBuf newDirectBuffer(ByteBuf buf) {
         return newDirectBuffer(buf, buf);
     }
@@ -272,12 +172,16 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     protected void doDisconnect() throws Exception {
     }
 
+    IOUringSubmissionQueue submissionQueue() {
+        IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
+        return ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
+    }
+
     @Override
     protected void doClose() throws Exception {
         if (parent() == null) {
             logger.trace("ServerSocket Close: {}", this.socket.intValue());
-            IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
-            IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
+            IOUringSubmissionQueue submissionQueue = submissionQueue();
             submissionQueue.addPollRemove(socket.intValue());
             submissionQueue.submit();
         }
@@ -322,10 +226,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             }
         } finally {
             socket.close();
-            if (readBuffer != null) {
-                readBuffer.release();
-                readBuffer = null;
-            }
         }
     }
 
@@ -335,20 +235,15 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     protected void doBeginRead() {
         logger.trace("Begin Read");
         final AbstractUringUnsafe unsafe = (AbstractUringUnsafe) unsafe();
-        if (!uringInReadyPending) {
-            unsafe.executeUringReadOperator();
+        if (!pollInScheduled) {
+            unsafe.schedulePollIn();
         }
-    }
-
-    public void executeReadEvent() {
-        final AbstractUringUnsafe unsafe = (AbstractUringUnsafe) unsafe();
-        unsafe.executeUringReadOperator();
     }
 
     @Override
     protected void doWrite(ChannelOutboundBuffer in) throws Exception {
         logger.trace("IOUring doWrite message size: {}", in.size());
-        if (writeable && in.size() >= 1) {
+        if (!writeScheduled && in.size() >= 1) {
             Object msg = in.current();
             if (msg instanceof ByteBuf) {
                 doWriteBytes((ByteBuf) msg);
@@ -366,7 +261,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             submissionQueue.addWrite(socket.intValue(), buf.memoryAddress(), buf.readerIndex(),
                                      buf.writerIndex());
             submissionQueue.submit();
-            writeable = false;
+            writeScheduled = true;
         }
     }
 
@@ -380,13 +275,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
 
     abstract class AbstractUringUnsafe extends AbstractUnsafe {
         private IOUringRecvByteAllocatorHandle allocHandle;
-        private final Runnable readRunnable = new Runnable() {
-
-            @Override
-            public void run() {
-                uringEventExecution(); //flush and submit SQE
-            }
-        };
 
         IOUringRecvByteAllocatorHandle newIOUringHandle(RecvByteBufAllocator.ExtendedHandle handle) {
             return new IOUringRecvByteAllocatorHandle(handle);
@@ -406,15 +294,41 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             return allocHandle;
         }
 
-        final void executeUringReadOperator() {
-            if (uringInReadyPending || !isActive() || shouldBreakIoUringInReady(config())) {
+        private void schedulePollIn() {
+            assert !pollInScheduled;
+            if (!isActive() || shouldBreakIoUringInReady(config())) {
                 return;
             }
-            uringInReadyPending = true;
-            eventLoop().execute(readRunnable);
+            pollInScheduled = true;
+            IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
+            IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
+            submissionQueue.addPollIn(socket.intValue());
+            submissionQueue.submit();
         }
 
-        public abstract void uringEventExecution();
+        final void readComplete(int res) {
+            pollInScheduled = false;
+            readComplete0(res);
+        }
+
+        abstract void readComplete0(int res);
+
+        abstract void scheduleRead();
+
+        void writeComplete(int res) {
+            writeScheduled = false;
+            ChannelOutboundBuffer channelOutboundBuffer = unsafe().outboundBuffer();
+            if (res > 0) {
+                channelOutboundBuffer.removeBytes(res);
+                try {
+                    doWrite(channelOutboundBuffer);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+
     }
 
     @Override
@@ -450,10 +364,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
         if (addr.isUnresolved()) {
             throw new UnresolvedAddressException();
         }
-    }
-
-    public void setUringInReadyPending(boolean uringInReadyPending) {
-        this.uringInReadyPending = uringInReadyPending;
     }
 
     @Override
@@ -510,9 +420,5 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
 
     final boolean shouldBreakIoUringInReady(ChannelConfig config) {
         return socket.isInputShutdown() && (inputClosedSeenErrorOnRead || !isAllowHalfClosure(config));
-    }
-
-    public void setWriteable(boolean writeable) {
-        this.writeable = writeable;
     }
 }

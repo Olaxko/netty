@@ -117,7 +117,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements
         final IOUringSubmissionQueue submissionQueue = ringBuffer.getIoUringSubmissionQueue();
 
         // Lets add the eventfd related events before starting to do any real work.
-        submissionQueue.addPollLink(eventfd.intValue());
+        submissionQueue.addPollIn(eventfd.intValue());
         submissionQueue.submit();
 
         for (;;) {
@@ -180,28 +180,13 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements
                     logger.trace("POLL_LINK canceled");
                     break;
                 }
-                AbstractIOUringServerChannel acceptChannel = (AbstractIOUringServerChannel) channels.get(fd);
-                if (acceptChannel == null) {
-                    break;
-                }
-                logger.trace("EventLoop Accept filedescriptor: {}", res);
-                acceptChannel.setUringInReadyPending(false);
-                if (res != -1 && res != ERRNO_EAGAIN_NEGATIVE &&
-                        res != ERRNO_EWOULDBLOCK_NEGATIVE) {
-                    logger.trace("server filedescriptor Fd: {}", fd);
-                    if (acceptChannel.acceptComplete(res)) {
-                        // all childChannels should poll POLLRDHUP
-                        submissionQueue.addPollRdHup(res);
-                        submissionQueue.submit();
-                    }
-                }
-                break;
+                // Fall-through
             case IOUring.OP_READ:
                 AbstractIOUringChannel readChannel = channels.get(fd);
                 if (readChannel == null) {
                     break;
                 }
-                readChannel.readComplete(res);
+                ((AbstractIOUringChannel.AbstractUringUnsafe) readChannel.unsafe()).readComplete(res);
                 break;
             case IOUring.OP_WRITE:
                 AbstractIOUringChannel writeChannel = channels.get(fd);
@@ -215,7 +200,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements
                 if (res == SOCKET_ERROR_EPIPE) {
                     writeChannel.shutdownInput(false);
                 } else {
-                    writeChannel.writeComplete(res);
+                    ((AbstractIOUringChannel.AbstractUringUnsafe) writeChannel.unsafe()).writeComplete(res);
                 }
                 break;
             case IOUring.IO_TIMEOUT:
@@ -236,18 +221,31 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements
                     // in the completionQueue without
                     // an extra eventfd_write(....)
                     Native.eventFdRead(eventfd.intValue());
-                    submissionQueue.addPollLink(eventfd.intValue());
+
+
+                    submissionQueue.addPollIn(eventfd.intValue());
                     // Submit so its picked up
                     submissionQueue.submit();
                 } else {
-                    if (pollMask == IOUring.POLLMASK_RDHUP) {
-                        AbstractIOUringChannel channel = channels.get(fd);
-                        if (channel != null && !channel.isActive()) {
-                            channel.shutdownInput(true);
-                        }
-                    } else {
-                        //Todo error handling error
-                        logger.trace("POLL_LINK Res: {}", res);
+                    AbstractIOUringChannel channel = channels.get(fd);
+                    if (channel == null) {
+                        break;
+                    }
+                    switch (pollMask) {
+                        case IOUring.POLLMASK_IN:
+                            // There is something to read so lets schedule it.
+                            ((AbstractIOUringChannel.AbstractUringUnsafe) channel.unsafe()).scheduleRead();
+                            break;
+                        case IOUring.POLLMASK_OUT:
+                            // TODO: Handle me
+                            break;
+                        case IOUring.POLLMASK_RDHUP:
+                            if (!channel.isActive()) {
+                                channel.shutdownInput(true);
+                            }
+                            break;
+                        default:
+                            break;
                     }
                 }
                 break;
