@@ -268,7 +268,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     // Channel/ChannelHandlerContext.read() was called
     @Override
     protected void doBeginRead() {
-        System.out.println("Begin Read");
         final AbstractUringUnsafe unsafe = (AbstractUringUnsafe) unsafe();
         if (!pollInScheduled) {
             unsafe.schedulePollIn();
@@ -377,7 +376,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             readComplete0(res);
         }
 
-        abstract void readComplete0(int res);
+        protected abstract void readComplete0(int res);
 
         abstract void pollIn(int res);
 

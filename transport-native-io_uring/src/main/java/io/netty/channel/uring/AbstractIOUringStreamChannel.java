@@ -34,6 +34,8 @@ import java.net.SocketAddress;
 import java.io.IOException;
 import java.util.concurrent.Executor;
 
+import static io.netty.channel.unix.Errors.ioResult;
+
 abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel implements DuplexChannel {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AbstractIOUringStreamChannel.class);
 
@@ -197,8 +199,14 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
             return super.prepareToClose();
         }
 
+        private ByteBuf readBuffer;
+
         @Override
         void pollIn(int res) {
+            readFromSocket();
+        }
+
+        private void readFromSocket() {
             final ChannelConfig config = config();
 
             final ByteBufAllocator allocator = config.getAllocator();
@@ -206,44 +214,40 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
             allocHandle.reset(config);
 
             ByteBuf byteBuf = allocHandle.allocate(allocator);
-            doReadBytes(byteBuf);
-        }
-
-        private ByteBuf readBuffer;
-
-        public void doReadBytes(ByteBuf byteBuf) {
-            assert readBuffer == null;
-            IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
-            IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
-
+            IOUringSubmissionQueue submissionQueue = submissionQueue();
             unsafe().recvBufAllocHandle().attemptedBytesRead(byteBuf.writableBytes());
 
-            if (byteBuf.hasMemoryAddress()) {
-                readBuffer = byteBuf;
-                submissionQueue.addRead(socket.intValue(), byteBuf.memoryAddress(),
-                        byteBuf.writerIndex(), byteBuf.capacity());
-                submissionQueue.submit();
-            }
+            assert readBuffer == null;
+            readBuffer = byteBuf;
+            submissionQueue.addRead(socket.intValue(), byteBuf.memoryAddress(),
+                    byteBuf.writerIndex(), byteBuf.capacity());
+            submissionQueue.submit();
         }
 
-        void readComplete0(int localReadAmount) {
+        // TODO: Respect MAX_MESSAGE_READ.
+        protected void readComplete0(int res) {
             boolean close = false;
-            ByteBuf byteBuf = null;
+
             final IOUringRecvByteAllocatorHandle allocHandle =
                     (IOUringRecvByteAllocatorHandle) unsafe()
                             .recvBufAllocHandle();
             final ChannelPipeline pipeline = pipeline();
+            ByteBuf byteBuf = this.readBuffer;
+            this.readBuffer = null;
+            int writable = 0;
+
             try {
-                logger.trace("EventLoop Read Res: {}", localReadAmount);
-                logger.trace("EventLoop Fd: {}", fd().intValue());
-                byteBuf = this.readBuffer;
-                this.readBuffer = null;
-
-                if (localReadAmount > 0) {
-                    byteBuf.writerIndex(byteBuf.writerIndex() + localReadAmount);
+                if (res < 0) {
+                    // If res is negative we should pass it to ioResult(...) which will either throw
+                    // or convert it to 0 if we could not read because the socket was not readable.
+                    allocHandle.lastBytesRead(ioResult("io_uring read", res));
+                } else if (res > 0) {
+                    byteBuf.writerIndex(byteBuf.writerIndex() + res);
+                    allocHandle.lastBytesRead(res);
+                } else {
+                    // EOF which we signal with -1.
+                    allocHandle.lastBytesRead(-1);
                 }
-
-                allocHandle.lastBytesRead(localReadAmount);
                 if (allocHandle.lastBytesRead() <= 0) {
                     // nothing was read, release the buffer.
                     byteBuf.release();
@@ -259,12 +263,20 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
                 }
 
                 allocHandle.incMessagesRead(1);
+                writable = byteBuf.writableBytes();
                 pipeline.fireChannelRead(byteBuf);
                 byteBuf = null;
-                allocHandle.readComplete();
-                pipeline.fireChannelReadComplete();
             } catch (Throwable t) {
                 handleReadException(pipeline, byteBuf, t, close, allocHandle);
+            }
+            if (!close) {
+                if (writable == 0) {
+                    // Let's schedule another read.
+                    readFromSocket();
+                } else {
+                    // We did not fill the whole ByteBuf so we should break the "read loop" and try again later.
+                    pipeline.fireChannelReadComplete();
+                }
             }
         }
 
