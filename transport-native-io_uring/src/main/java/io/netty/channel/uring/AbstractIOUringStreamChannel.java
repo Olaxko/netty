@@ -49,18 +49,15 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
 
     AbstractIOUringStreamChannel(Channel parent, LinuxSocket fd, SocketAddress remote) {
         super(parent, fd, remote);
-        // Add EPOLLRDHUP so we are notified once the remote peer close the connection.
     }
 
     @Override
     public ChannelFuture shutdown() {
-        System.out.println("AbstractStreamChannel shutdown");
         return shutdown(newPromise());
     }
 
     @Override
     public ChannelFuture shutdown(final ChannelPromise promise) {
-
         ChannelFuture shutdownOutputFuture = shutdownOutput();
         if (shutdownOutputFuture.isDone()) {
             shutdownOutputDone(shutdownOutputFuture, promise);
@@ -175,7 +172,6 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
     private static void shutdownDone(ChannelFuture shutdownOutputFuture,
                                      ChannelFuture shutdownInputFuture,
                                      ChannelPromise promise) {
-        System.out.println("AbstractStreamChannel ShutdownDone");
         Throwable shutdownOutputCause = shutdownOutputFuture.cause();
         Throwable shutdownInputCause = shutdownInputFuture.cause();
         if (shutdownOutputCause != null) {

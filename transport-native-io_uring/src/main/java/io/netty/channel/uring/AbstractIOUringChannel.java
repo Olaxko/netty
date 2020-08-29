@@ -34,12 +34,7 @@ import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.channel.socket.SocketChannelConfig;
-import io.netty.channel.unix.Buffer;
-import io.netty.channel.unix.FileDescriptor;
-import io.netty.channel.unix.NativeInetAddress;
-import io.netty.channel.unix.Socket;
-import io.netty.channel.unix.UnixChannel;
-import io.netty.channel.unix.UnixChannelUtil;
+import io.netty.channel.unix.*;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -70,7 +65,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     protected volatile boolean active;
     private boolean pollInScheduled = false;
 
-    //boolean uringInReadyPending;
     boolean inputClosedSeenErrorOnRead;
 
     static final int SOCK_ADDR_LEN = 128;
@@ -286,17 +280,15 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     }
 
     protected final void doWriteBytes(ByteBuf buf) {
-        if (buf.hasMemoryAddress()) {
-            //link poll<link>write operation
-            addPollOut();
+        //link poll<link>write operation
+        //addPollOut();
 
-            IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
-            IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
-            submissionQueue.addWrite(socket.intValue(), buf.memoryAddress(), buf.readerIndex(),
-                                     buf.writerIndex());
-            submissionQueue.submit();
-            writeScheduled = true;
-        }
+        IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
+        IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
+        submissionQueue.addWrite(socket.intValue(), buf.memoryAddress(), buf.readerIndex(),
+                buf.writerIndex());
+        submissionQueue.submit();
+        writeScheduled = true;
     }
 
     //POLLOUT
@@ -437,14 +429,18 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
                     submissionQueue.addPollOut(fd().intValue());
                     submissionQueue.submit();
                 } else {
-                /*
-                if (res == -1 || res == -4) {
-                    submissionQueue.addConnect(fd, channel.getRemoteAddressMemoryAddress(),
-                                           AbstractIOUringChannel.SOCK_ADDR_LEN);
-                    submissionQueue.submit();
-                    break;
-                }
-                */
+                    try {
+                        Errors.throwConnectException("io_uring connect", res);
+                    } catch (Throwable cause) {
+                        fulfillConnectPromise(connectPromise, cause);
+                    } finally {
+                        // Check for null as the connectTimeoutFuture is only created if a connectTimeoutMillis > 0 is used
+                        // See https://github.com/netty/netty/issues/1770
+                        if (connectTimeoutFuture != null) {
+                            connectTimeoutFuture.cancel(false);
+                        }
+                        connectPromise = null;
+                    }
                 }
             }
         }
@@ -564,7 +560,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     /**
      * Connect to the remote peer
      */
-    protected void doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
+    private void doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
         if (localAddress instanceof InetSocketAddress) {
             checkResolvable((InetSocketAddress) localAddress);
         }
@@ -584,27 +580,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
 
         if (localAddress != null) {
             socket.bind(localAddress);
-        }
-    }
-
-//    public void setRemote() {
-//        remote = remoteSocketAddr == null ?
-//                    remoteAddress : computeRemoteAddr(remoteSocketAddr, socket.remoteAddress());
-//    }
-
-    private boolean doConnect0(SocketAddress remote) throws Exception {
-        boolean success = false;
-        try {
-            boolean connected = socket.connect(remote);
-            if (!connected) {
-                //setFlag(Native.EPOLLOUT);
-            }
-            success = true;
-            return connected;
-        } finally {
-            if (!success) {
-                doClose();
-            }
         }
     }
 
