@@ -269,7 +269,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     }
 
     @Override
-    protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+    protected void doWrite(ChannelOutboundBuffer in) {
         logger.trace("IOUring doWrite message size: {}", in.size());
         if (!writeScheduled && in.size() >= 1) {
             Object msg = in.current();
@@ -280,9 +280,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     }
 
     protected final void doWriteBytes(ByteBuf buf) {
-        //link poll<link>write operation
-        //addPollOut();
-
         IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
         IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
         submissionQueue.addWrite(socket.intValue(), buf.memoryAddress(), buf.readerIndex(),
@@ -293,8 +290,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
 
     //POLLOUT
     private void addPollOut() {
-        IOUringEventLoop ioUringEventLoop = (IOUringEventLoop) eventLoop();
-        IOUringSubmissionQueue submissionQueue = ioUringEventLoop.getRingBuffer().getIoUringSubmissionQueue();
+        IOUringSubmissionQueue submissionQueue = submissionQueue();
         submissionQueue.addPollOutLink(socket.intValue());
         submissionQueue.submit();
     }
@@ -401,8 +397,9 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
                         connectPromise = null;
                     }
                 }
+            } else if (!getSocket().isOutputShutdown()) {
+                doWrite(unsafe().outboundBuffer());
             }
-
         }
 
         void writeComplete(int res) {
@@ -410,10 +407,15 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             ChannelOutboundBuffer channelOutboundBuffer = unsafe().outboundBuffer();
             if (res > 0) {
                 channelOutboundBuffer.removeBytes(res);
+                doWrite(channelOutboundBuffer);
+            } else if (res < 0){
                 try {
-                    doWrite(channelOutboundBuffer);
-                } catch (Exception e) {
-                    e.printStackTrace();
+                    if (ioResult("io_uring write", res) == 0) {
+                        // We were not able to write everything, let's register for POLLOUT
+                        addPollOut();
+                    }
+                } catch (Throwable cause) {
+                    handleWriteError(cause);
                 }
             }
         }
@@ -425,9 +427,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             } else {
                 if (res == ERRNO_EINPROGRESS_NEGATIVE) {
                     // connect not complete yet need to wait for poll_out event
-                    IOUringSubmissionQueue submissionQueue = submissionQueue();
-                    submissionQueue.addPollOut(fd().intValue());
-                    submissionQueue.submit();
+                    addPollOut();
                 } else {
                     try {
                         Errors.throwConnectException("io_uring connect", res);

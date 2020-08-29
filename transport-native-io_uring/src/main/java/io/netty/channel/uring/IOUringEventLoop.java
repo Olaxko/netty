@@ -151,11 +151,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements
                 }
             }
 
-            try {
-                completionQueue.process(this);
-            } catch (Exception e) {
-                //Todo handle exception
-            }
+            completionQueue.process(this);
 
             if (hasTasks()) {
                 runAllTasks();
@@ -199,15 +195,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements
                 if (writeChannel == null) {
                     break;
                 }
-                //localFlushAmount -> res
-                logger.trace("EventLoop Write Res: {}", res);
-                logger.trace("EventLoop Fd: {}", fd);
-
-                if (res == SOCKET_ERROR_EPIPE) {
-                    writeChannel.shutdownInput(false);
-                } else {
-                    ((AbstractIOUringChannel.AbstractUringUnsafe) writeChannel.unsafe()).writeComplete(res);
-                }
+                ((AbstractIOUringChannel.AbstractUringUnsafe) writeChannel.unsafe()).writeComplete(res);
                 break;
 
             case IOUring.IO_TIMEOUT:
