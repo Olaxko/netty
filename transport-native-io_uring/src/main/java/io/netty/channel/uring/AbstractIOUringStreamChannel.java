@@ -191,6 +191,15 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
         }
     }
 
+    @Override
+    protected void doRegister() throws Exception {
+        super.doRegister();
+        // all non-server channels should poll POLLRDHUP
+        IOUringSubmissionQueue submissionQueue = submissionQueue();
+        submissionQueue.addPollRdHup(fd().intValue());
+        submissionQueue.submit();
+    }
+
     class IOUringStreamUnsafe extends AbstractUringUnsafe {
 
         // Overridden here just to be able to access this method from AbstractEpollStreamChannel
@@ -234,7 +243,9 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
             final ChannelPipeline pipeline = pipeline();
             ByteBuf byteBuf = this.readBuffer;
             this.readBuffer = null;
-            int writable = 0;
+            assert byteBuf != null;
+
+            boolean writable = true;
 
             try {
                 if (res < 0) {
@@ -263,14 +274,14 @@ abstract class AbstractIOUringStreamChannel extends AbstractIOUringChannel imple
                 }
 
                 allocHandle.incMessagesRead(1);
-                writable = byteBuf.writableBytes();
+                writable = byteBuf.isWritable();
                 pipeline.fireChannelRead(byteBuf);
                 byteBuf = null;
             } catch (Throwable t) {
                 handleReadException(pipeline, byteBuf, t, close, allocHandle);
             }
             if (!close) {
-                if (writable == 0) {
+                if (!writable) {
                     // Let's schedule another read.
                     readFromSocket();
                 } else {

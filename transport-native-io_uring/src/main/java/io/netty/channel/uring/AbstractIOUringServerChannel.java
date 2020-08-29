@@ -77,15 +77,7 @@ abstract class AbstractIOUringServerChannel extends AbstractIOUringChannel imple
                 if (res >= 0) {
                     allocHandle.incMessagesRead(1);
                     try {
-                        final Channel childChannel = newChildChannel(res);
-
-                        // all childChannels should poll POLLRDHUP
-                        // TODO: Should this be true for all non server channels ?
-                        IOUringSubmissionQueue submissionQueue = submissionQueue();
-                        submissionQueue.addPollRdHup(res);
-                        submissionQueue.submit();
-
-                        pipeline.fireChannelRead(childChannel);
+                        pipeline.fireChannelRead(newChildChannel(res));
                     } catch (Throwable cause) {
                         allocHandle.readComplete();
                         pipeline.fireExceptionCaught(cause);
